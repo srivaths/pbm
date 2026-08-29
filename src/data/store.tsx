@@ -16,11 +16,24 @@ import type {
   EventInstance,
   EventTemplate,
   Member,
+  MemberStatus,
   MembershipType,
+  RatingEntry,
+  RatingSource,
   SkillLevel,
 } from '@/types';
 
-export type Club = { id: string; name: string };
+export type Club = { id: string; name: string; graceDays: number };
+
+export type RatingInput = {
+  rating: number;
+  source: RatingSource;
+  asOf: string; // ISO date
+  note: string | null;
+};
+
+// Attendance derived from bookings (confirmed on past vs future sessions).
+export type Attendance = { attended: number; upcoming: number };
 
 export type InstanceStatus = {
   confirmedCount: number;
@@ -59,11 +72,15 @@ type StoreValue = {
   events: EventTemplate[];
   instances: EventInstance[];
   bookings: Booking[];
+  ratingHistory: RatingEntry[];
   currentMemberId: string | null;
   isAdmin: boolean;
   statusFor: (instanceId: string) => InstanceStatus;
-  book: (instanceId: string) => Promise<void>;
-  cancel: (instanceId: string) => Promise<void>;
+  ratingsFor: (memberId: string) => RatingEntry[];
+  attendanceFor: (memberId: string) => Attendance;
+  // Resolve to an error message string, or null on success.
+  book: (instanceId: string) => Promise<string | null>;
+  cancel: (instanceId: string) => Promise<string | null>;
   // Admin removes any member's booking (triggers waitlist auto-promote).
   adminCancelBooking: (instanceId: string, memberId: string) => Promise<string | null>;
   // Admin-only writes. Resolve to an error message string, or null on success.
@@ -75,6 +92,9 @@ type StoreValue = {
   createMember: (input: MemberInput) => Promise<string | null>;
   updateMember: (id: string, input: MemberInput) => Promise<string | null>;
   deleteMember: (id: string) => Promise<string | null>;
+  setMemberStatus: (id: string, status: MemberStatus) => Promise<string | null>;
+  addRating: (memberId: string, input: RatingInput) => Promise<string | null>;
+  updateGraceDays: (days: number) => Promise<string | null>;
   refresh: () => Promise<void>;
 };
 
@@ -111,7 +131,19 @@ function toMember(r: any): Member {
     membershipType: r.membership_type,
     skillRating: Number(r.skill_rating),
     duesStatus: r.dues_status,
+    status: r.status ?? 'active',
+    pastDueSince: r.past_due_since ?? null,
     joinedAt: r.joined_at,
+  };
+}
+function toRating(r: any): RatingEntry {
+  return {
+    id: r.id,
+    memberId: r.member_id,
+    rating: Number(r.rating),
+    source: r.source,
+    asOf: r.as_of,
+    note: r.note ?? null,
   };
 }
 function toEvent(r: any): EventTemplate {
@@ -146,6 +178,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [events, setEvents] = useState<EventTemplate[]>([]);
   const [instances, setInstances] = useState<EventInstance[]>([]);
   const [bookings, setBookings] = useState<Booking[]>([]);
+  const [ratingHistory, setRatingHistory] = useState<RatingEntry[]>([]);
   const [currentMemberId, setCurrentMemberId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -153,30 +186,41 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setError(null);
     try {
       const { data: results, error: batchError } = await withAuthRetry(async () => {
-        const [clubsRes, membersRes, eventsRes, instancesRes, bookingsRes] = await Promise.all([
+        const [clubsRes, membersRes, eventsRes, instancesRes, bookingsRes, ratingsRes] = await Promise.all([
           supabase.from('clubs').select('*').limit(1).maybeSingle(),
           supabase.from('members').select('*'),
           supabase.from('events').select('*'),
           supabase.from('event_instances').select('*'),
           supabase.from('bookings').select('*'),
+          supabase.from('member_rating_history').select('*'),
         ]);
         const error =
-          clubsRes.error || membersRes.error || eventsRes.error || instancesRes.error || bookingsRes.error;
-        return { data: { clubsRes, membersRes, eventsRes, instancesRes, bookingsRes }, error };
+          clubsRes.error ||
+          membersRes.error ||
+          eventsRes.error ||
+          instancesRes.error ||
+          bookingsRes.error ||
+          ratingsRes.error;
+        return { data: { clubsRes, membersRes, eventsRes, instancesRes, bookingsRes, ratingsRes }, error };
       });
       if (batchError) throw batchError;
-      const { clubsRes, membersRes, eventsRes, instancesRes, bookingsRes } = results;
+      const { clubsRes, membersRes, eventsRes, instancesRes, bookingsRes, ratingsRes } = results;
 
       const memberRows = membersRes.data ?? [];
       // The current user's own member row is the one linked to their auth id.
       const mine = memberRows.find((m: any) => m.user_id === userId);
       setCurrentMemberId(mine ? mine.id : null);
 
-      setClub(clubsRes.data ? { id: clubsRes.data.id, name: clubsRes.data.name } : null);
+      setClub(
+        clubsRes.data
+          ? { id: clubsRes.data.id, name: clubsRes.data.name, graceDays: clubsRes.data.grace_days ?? 14 }
+          : null,
+      );
       setMembers(memberRows.map(toMember));
       setEvents((eventsRes.data ?? []).map(toEvent));
       setInstances((instancesRes.data ?? []).map(toInstance));
       setBookings((bookingsRes.data ?? []).map(toBooking));
+      setRatingHistory((ratingsRes.data ?? []).map(toRating));
     } catch (e: any) {
       setError(e?.message ?? 'Failed to load club data');
     }
@@ -215,25 +259,50 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const book = useCallback(
-    async (instanceId: string) => {
+    async (instanceId: string): Promise<string | null> => {
       const { error } = await withAuthRetry(async () =>
         supabase.rpc('book_slot', { p_instance_id: instanceId }),
       );
-      if (error) setError(error.message);
+      if (error) return error.message;
       await load();
+      return null;
     },
     [load],
   );
 
   const cancel = useCallback(
-    async (instanceId: string) => {
+    async (instanceId: string): Promise<string | null> => {
       const { error } = await withAuthRetry(async () =>
         supabase.rpc('cancel_booking', { p_instance_id: instanceId }),
       );
-      if (error) setError(error.message);
+      if (error) return error.message;
       await load();
+      return null;
     },
     [load],
+  );
+
+  const ratingsFor = useCallback(
+    (memberId: string): RatingEntry[] =>
+      ratingHistory.filter((r) => r.memberId === memberId).sort((a, b) => b.asOf.localeCompare(a.asOf)),
+    [ratingHistory],
+  );
+
+  const attendanceFor = useCallback(
+    (memberId: string): Attendance => {
+      const now = new Date().toISOString();
+      let attended = 0;
+      let upcoming = 0;
+      for (const b of bookings) {
+        if (b.memberId !== memberId || b.status !== 'confirmed') continue;
+        const startsAt = instances.find((i) => i.id === b.instanceId)?.startsAt;
+        if (!startsAt) continue;
+        if (startsAt < now) attended += 1;
+        else upcoming += 1;
+      }
+      return { attended, upcoming };
+    },
+    [bookings, instances],
   );
 
   const isAdmin = useMemo(
@@ -386,6 +455,52 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [load],
   );
 
+  const setMemberStatus = useCallback(
+    async (id: string, status: MemberStatus): Promise<string | null> => {
+      if (id === currentMemberId && status === 'suspended') {
+        return "You can't suspend your own account.";
+      }
+      const { error } = await withAuthRetry(async () =>
+        supabase.rpc('admin_set_member_status', { p_member_id: id, p_status: status }),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load, currentMemberId],
+  );
+
+  const addRating = useCallback(
+    async (memberId: string, input: RatingInput): Promise<string | null> => {
+      const { error } = await withAuthRetry(async () =>
+        supabase.from('member_rating_history').insert({
+          member_id: memberId,
+          rating: input.rating,
+          source: input.source,
+          as_of: input.asOf,
+          note: input.note,
+        }),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load],
+  );
+
+  const updateGraceDays = useCallback(
+    async (days: number): Promise<string | null> => {
+      if (!club) return 'No club loaded yet.';
+      const { error } = await withAuthRetry(async () =>
+        supabase.from('clubs').update({ grace_days: days }).eq('id', club.id),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [club, load],
+  );
+
   const value = useMemo<StoreValue>(
     () => ({
       loading,
@@ -395,9 +510,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       events,
       instances,
       bookings,
+      ratingHistory,
       currentMemberId,
       isAdmin,
       statusFor,
+      ratingsFor,
+      attendanceFor,
       book,
       cancel,
       adminCancelBooking,
@@ -409,6 +527,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       createMember,
       updateMember,
       deleteMember,
+      setMemberStatus,
+      addRating,
+      updateGraceDays,
       refresh: load,
     }),
     [
@@ -419,9 +540,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       events,
       instances,
       bookings,
+      ratingHistory,
       currentMemberId,
       isAdmin,
       statusFor,
+      ratingsFor,
+      attendanceFor,
       book,
       cancel,
       adminCancelBooking,
@@ -433,6 +557,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       createMember,
       updateMember,
       deleteMember,
+      setMemberStatus,
+      addRating,
+      updateGraceDays,
       load,
     ],
   );

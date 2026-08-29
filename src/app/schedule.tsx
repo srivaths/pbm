@@ -79,10 +79,12 @@ export default function ScheduleScreen() {
 
   const sorted = [...instances].sort((a, b) => a.startsAt.localeCompare(b.startsAt));
 
-  const run = async (instanceId: string, fn: (id: string) => Promise<void>) => {
+  const run = async (instanceId: string, fn: (id: string) => Promise<string | null>) => {
     setPending(instanceId);
+    setActionError(null);
     try {
-      await fn(instanceId);
+      const err = await fn(instanceId);
+      setActionError(err);
     } finally {
       setPending(null);
     }

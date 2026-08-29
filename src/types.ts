@@ -7,14 +7,31 @@ export type MembershipType = 'admin' | 'generic' | 'family';
 
 export type DuesStatus = 'active' | 'past_due' | 'none';
 
+// Roster lifecycle, separate from dues. Suspended keeps the row + history.
+export type MemberStatus = 'active' | 'suspended';
+
 export type Member = {
   id: string;
   name: string;
   email: string;
   membershipType: MembershipType;
-  skillRating: number; // e.g. 3.5
+  skillRating: number; // e.g. 3.5 — coarse band used for event matching
   duesStatus: DuesStatus;
+  status: MemberStatus;
+  pastDueSince: string | null; // ISO date the member went past due, else null
   joinedAt: string; // ISO date
+};
+
+export type RatingSource = 'DUPR' | 'self' | 'admin';
+
+// A point-in-time rating snapshot (e.g. DUPR as of a date).
+export type RatingEntry = {
+  id: string;
+  memberId: string;
+  rating: number;
+  source: RatingSource;
+  asOf: string; // ISO date
+  note: string | null;
 };
 
 export type EventTemplate = {
