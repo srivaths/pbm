@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 
+import { ThemedText } from '@/components/themed-text';
 import { useStore } from '@/data/store';
 import { duesLabel, membershipLabel } from '@/lib/format';
 import type { DuesStatus, Member, MembershipType } from '@/types';
@@ -18,8 +19,9 @@ export function MemberFormModal({
   initial?: Member | null;
   onClose: () => void;
 }) {
-  const { createMember, updateMember } = useStore();
+  const { createMember, updateMember, currentMemberId } = useStore();
   const editing = Boolean(initial);
+  const isSelf = editing && initial?.id === currentMemberId;
 
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -84,13 +86,28 @@ export function MemberFormModal({
         placeholder="jordan@example.com"
         autoCapitalize="none"
       />
-      <ChipSelect
-        label="Membership"
-        options={MEMBERSHIP_TYPES}
-        value={membership}
-        onChange={setMembership}
-        renderLabel={membershipLabel}
-      />
+      {isSelf ? (
+        <ChipSelect
+          label="Membership"
+          options={['admin'] as const}
+          value="admin"
+          onChange={() => {}}
+          renderLabel={membershipLabel}
+        />
+      ) : (
+        <ChipSelect
+          label="Membership"
+          options={MEMBERSHIP_TYPES}
+          value={membership}
+          onChange={setMembership}
+          renderLabel={membershipLabel}
+        />
+      )}
+      {isSelf ? (
+        <ThemedText type="small" themeColor="textSecondary">
+          You can't change your own role — another admin can, or use SQL.
+        </ThemedText>
+      ) : null}
       <ChipSelect label="Skill rating" options={SKILL_RATINGS} value={skill} onChange={setSkill} />
       <ChipSelect
         label="Dues"

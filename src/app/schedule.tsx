@@ -47,10 +47,35 @@ function CapacityBar({ confirmed, capacity }: { confirmed: number; capacity: num
 }
 
 export default function ScheduleScreen() {
-  const { events, instances, statusFor, book, cancel, loading, isAdmin, deleteInstance } = useStore();
+  const { events, instances, bookings, members, statusFor, book, cancel, loading, isAdmin, deleteInstance, adminCancelBooking } =
+    useStore();
   const [pending, setPending] = useState<string | null>(null);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+
+  const toggleRoster = (id: string) => setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
+
+  const memberName = (id: string) => members.find((m) => m.id === id)?.name ?? 'Unknown member';
+
+  // Roster ordered the way seats are filled: confirmed first, then the waitlist
+  // in join order (which is the promote order).
+  const rosterFor = (instanceId: string) =>
+    bookings
+      .filter((b) => b.instanceId === instanceId)
+      .sort((a, b) => {
+        if (a.status !== b.status) return a.status === 'confirmed' ? -1 : 1;
+        return a.createdAt.localeCompare(b.createdAt);
+      });
+
+  const removeBooking = async (instanceId: string, memberId: string, name: string) => {
+    const ok = await confirmAsync(`Remove ${name} from this session?`, 'Remove');
+    if (!ok) return;
+    setPending(instanceId);
+    const err = await adminCancelBooking(instanceId, memberId);
+    setPending(null);
+    setActionError(err);
+  };
 
   const sorted = [...instances].sort((a, b) => a.startsAt.localeCompare(b.startsAt));
 
@@ -147,17 +172,64 @@ export default function ScheduleScreen() {
               </View>
 
               {isAdmin ? (
-                <View style={styles.adminRow}>
-                  <Pressable
-                    onPress={() => removeInstance(instance.id, event.title, whenLabel)}
-                    disabled={busy}
-                    style={({ pressed }) => pressed && styles.pressed}>
-                    <View style={[styles.btn, styles.btnDanger]}>
-                      <ThemedText type="smallBold" style={styles.dangerText}>
-                        Delete session
-                      </ThemedText>
-                    </View>
-                  </Pressable>
+                <View style={styles.adminBox}>
+                  {(() => {
+                    const roster = rosterFor(instance.id);
+                    const isOpen = expanded[instance.id];
+                    return (
+                      <>
+                        <View style={styles.adminHeaderRow}>
+                          <Pressable
+                            onPress={() => toggleRoster(instance.id)}
+                            style={({ pressed }) => pressed && styles.pressed}>
+                            <ThemedText type="smallBold" themeColor="textSecondary">
+                              {isOpen ? '▾' : '▸'} Roster ({roster.length})
+                            </ThemedText>
+                          </Pressable>
+                          <Pressable
+                            onPress={() => removeInstance(instance.id, event.title, whenLabel)}
+                            disabled={busy}
+                            style={({ pressed }) => pressed && styles.pressed}>
+                            <View style={[styles.btn, styles.btnDanger]}>
+                              <ThemedText type="smallBold" style={styles.dangerText}>
+                                Delete session
+                              </ThemedText>
+                            </View>
+                          </Pressable>
+                        </View>
+
+                        {isOpen ? (
+                          roster.length === 0 ? (
+                            <ThemedText type="small" themeColor="textSecondary">
+                              No one has booked yet.
+                            </ThemedText>
+                          ) : (
+                            <View style={styles.rosterList}>
+                              {roster.map((b) => (
+                                <View key={b.id} style={styles.rosterRow}>
+                                  <View style={styles.rosterWho}>
+                                    <ThemedText type="small">{memberName(b.memberId)}</ThemedText>
+                                    <Badge
+                                      label={b.status === 'confirmed' ? 'Confirmed' : 'Waitlisted'}
+                                      tone={b.status === 'confirmed' ? 'good' : 'warn'}
+                                    />
+                                  </View>
+                                  <Pressable
+                                    onPress={() => removeBooking(instance.id, b.memberId, memberName(b.memberId))}
+                                    disabled={busy}
+                                    style={({ pressed }) => pressed && styles.pressed}>
+                                    <ThemedText type="smallBold" style={styles.dangerText}>
+                                      Remove
+                                    </ThemedText>
+                                  </Pressable>
+                                </View>
+                              ))}
+                            </View>
+                          )
+                        ) : null}
+                      </>
+                    );
+                  })()}
                 </View>
               ) : null}
             </ThemedView>
@@ -220,10 +292,33 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: Spacing.two,
   },
-  adminRow: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
+  adminBox: {
     marginTop: Spacing.one,
+    paddingTop: Spacing.two,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: 'rgba(127,127,127,0.3)',
+    gap: Spacing.two,
+  },
+  adminHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
+  },
+  rosterList: {
+    gap: Spacing.two,
+  },
+  rosterRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
+  },
+  rosterWho: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.two,
+    flex: 1,
   },
   btn: {
     paddingVertical: Spacing.one,

@@ -64,6 +64,8 @@ type StoreValue = {
   statusFor: (instanceId: string) => InstanceStatus;
   book: (instanceId: string) => Promise<void>;
   cancel: (instanceId: string) => Promise<void>;
+  // Admin removes any member's booking (triggers waitlist auto-promote).
+  adminCancelBooking: (instanceId: string, memberId: string) => Promise<string | null>;
   // Admin-only writes. Resolve to an error message string, or null on success.
   createEvent: (input: EventInput) => Promise<string | null>;
   updateEvent: (id: string, input: EventInput) => Promise<string | null>;
@@ -239,6 +241,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [members, currentMemberId],
   );
 
+  const adminCancelBooking = useCallback(
+    async (instanceId: string, memberId: string): Promise<string | null> => {
+      const { error } = await withAuthRetry(async () =>
+        supabase.rpc('admin_cancel_booking', { p_instance_id: instanceId, p_member_id: memberId }),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load],
+  );
+
   const createEvent = useCallback(
     async (input: EventInput): Promise<string | null> => {
       if (!club) return 'No club loaded yet.';
@@ -338,6 +352,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const updateMember = useCallback(
     async (id: string, input: MemberInput): Promise<string | null> => {
+      // Guard against an admin accidentally removing their own admin access and
+      // locking themselves out of the admin tools.
+      if (id === currentMemberId && input.membershipType !== 'admin') {
+        return "You can't remove your own admin role.";
+      }
       const { error } = await withAuthRetry(async () =>
         supabase
           .from('members')
@@ -354,7 +373,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       await load();
       return null;
     },
-    [load],
+    [load, currentMemberId],
   );
 
   const deleteMember = useCallback(
@@ -381,6 +400,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       statusFor,
       book,
       cancel,
+      adminCancelBooking,
       createEvent,
       updateEvent,
       deleteEvent,
@@ -404,6 +424,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       statusFor,
       book,
       cancel,
+      adminCancelBooking,
       createEvent,
       updateEvent,
       deleteEvent,
