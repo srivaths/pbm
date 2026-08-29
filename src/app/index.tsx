@@ -1,12 +1,12 @@
 import { Link } from 'expo-router';
 import { Pressable, StyleSheet, View } from 'react-native';
 
+import { useAuth } from '@/auth/AuthProvider';
 import { Badge } from '@/components/ui/badge';
 import { Screen } from '@/components/ui/screen';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
-import { CLUB, CURRENT_MEMBER_ID, EVENTS, EVENT_INSTANCES, MEMBERS } from '@/data/mock';
 import { useStore } from '@/data/store';
 import { formatDateTime } from '@/lib/format';
 
@@ -30,26 +30,31 @@ const SHORTCUTS: { href: string; emoji: string; label: string }[] = [
 ];
 
 export default function HomeScreen() {
-  const { bookings, statusFor } = useStore();
+  const { signOut } = useAuth();
+  const { loading, error, club, members, events, instances, bookings, currentMemberId } = useStore();
 
   const myBookings = bookings
-    .filter((b) => b.memberId === CURRENT_MEMBER_ID)
+    .filter((b) => b.memberId === currentMemberId)
     .map((b) => {
-      const instance = EVENT_INSTANCES.find((i) => i.id === b.instanceId);
-      const event = instance ? EVENTS.find((e) => e.id === instance.eventId) : undefined;
+      const instance = instances.find((i) => i.id === b.instanceId);
+      const event = instance ? events.find((e) => e.id === instance.eventId) : undefined;
       return instance && event ? { booking: b, instance, event } : null;
     })
     .filter((x): x is NonNullable<typeof x> => x !== null)
     .sort((a, b) => a.instance.startsAt.localeCompare(b.instance.startsAt));
 
-  const upcomingCount = EVENT_INSTANCES.filter(
-    (i) => new Date(i.startsAt).getTime() > Date.now(),
-  ).length;
+  const upcomingCount = instances.filter((i) => new Date(i.startsAt).getTime() > Date.now()).length;
 
   return (
-    <Screen title={CLUB.name} subtitle="Your club at a glance">
+    <Screen title={club?.name ?? (loading ? 'Loading…' : 'Your club')} subtitle="Your club at a glance">
+      {error ? (
+        <ThemedView type="backgroundElement" style={styles.errorCard}>
+          <ThemedText type="small">Couldn't load data: {error}</ThemedText>
+        </ThemedView>
+      ) : null}
+
       <View style={styles.statRow}>
-        <Stat value={MEMBERS.length} label="Members" />
+        <Stat value={members.length} label="Members" />
         <Stat value={upcomingCount} label="Upcoming" />
         <Stat value={myBookings.length} label="My sessions" />
       </View>
@@ -63,29 +68,21 @@ export default function HomeScreen() {
             </ThemedText>
           </ThemedView>
         ) : (
-          myBookings.map(({ booking, instance, event }) => {
-            const status = statusFor(instance.id);
-            return (
-              <ThemedView key={booking.id} type="backgroundElement" style={styles.row}>
-                <View style={styles.rowMain}>
-                  <ThemedText type="smallBold">{event.title}</ThemedText>
-                  <ThemedText type="small" themeColor="textSecondary">
-                    {formatDateTime(instance.startsAt)}
-                  </ThemedText>
-                </View>
-                {booking.status === 'waitlisted' ? (
-                  <Badge label="Waitlisted" tone="warn" />
-                ) : (
-                  <Badge label="Confirmed" tone="good" />
-                )}
-                {booking.status === 'waitlisted' ? (
-                  <ThemedText type="small" themeColor="textSecondary" style={styles.hint}>
-                    #{status.waitlistCount} on list
-                  </ThemedText>
-                ) : null}
-              </ThemedView>
-            );
-          })
+          myBookings.map(({ booking, instance, event }) => (
+            <ThemedView key={booking.id} type="backgroundElement" style={styles.row}>
+              <View style={styles.rowMain}>
+                <ThemedText type="smallBold">{event.title}</ThemedText>
+                <ThemedText type="small" themeColor="textSecondary">
+                  {formatDateTime(instance.startsAt)}
+                </ThemedText>
+              </View>
+              {booking.status === 'waitlisted' ? (
+                <Badge label="Waitlisted" tone="warn" />
+              ) : (
+                <Badge label="Confirmed" tone="good" />
+              )}
+            </ThemedView>
+          ))
         )}
       </View>
 
@@ -104,6 +101,12 @@ export default function HomeScreen() {
           ))}
         </View>
       </View>
+
+      <Pressable onPress={signOut} style={({ pressed }) => pressed && styles.pressed}>
+        <ThemedText type="small" themeColor="textSecondary" style={styles.signOut}>
+          Sign out
+        </ThemedText>
+      </Pressable>
     </Screen>
   );
 }
@@ -126,20 +129,25 @@ const styles = StyleSheet.create({
   block: {
     gap: Spacing.two,
   },
+  errorCard: {
+    padding: Spacing.three,
+    borderRadius: Spacing.three,
+  },
   emptyCard: {
     padding: Spacing.three,
     borderRadius: Spacing.three,
   },
   row: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     padding: Spacing.three,
     borderRadius: Spacing.three,
-    gap: Spacing.half,
+    gap: Spacing.two,
   },
   rowMain: {
     gap: 2,
-  },
-  hint: {
-    marginTop: 2,
+    flex: 1,
   },
   shortcutRow: {
     flexDirection: 'row',
@@ -154,6 +162,11 @@ const styles = StyleSheet.create({
   },
   shortcutEmoji: {
     fontSize: 24,
+  },
+  signOut: {
+    textAlign: 'center',
+    paddingVertical: Spacing.two,
+    textDecorationLine: 'underline',
   },
   pressed: {
     opacity: 0.7,

@@ -1,13 +1,26 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from 'react';
 
-import { CURRENT_MEMBER_ID, EVENT_INSTANCES, MEMBERS, SEED_BOOKINGS } from '@/data/mock';
-import type { Booking } from '@/types';
+import { useAuth } from '@/auth/AuthProvider';
+import { supabase } from '@/lib/supabase';
+import type {
+  Booking,
+  DuesStatus,
+  EventInstance,
+  EventTemplate,
+  Member,
+  MembershipType,
+  SkillLevel,
+} from '@/types';
 
-let idCounter = 1000;
-function nextId() {
-  idCounter += 1;
-  return `b${idCounter}`;
-}
+export type Club = { id: string; name: string };
 
 export type InstanceStatus = {
   confirmedCount: number;
@@ -18,32 +31,175 @@ export type InstanceStatus = {
   myBooking: Booking | null;
 };
 
+// Admin write payloads (camelCase; mapped to snake_case columns on write).
+export type EventInput = {
+  title: string;
+  durationMin: number;
+  skillLevel: SkillLevel;
+  instructor: string | null;
+};
+export type InstanceInput = {
+  eventId: string;
+  startsAt: string; // ISO timestamp
+  capacity: number;
+};
+export type MemberInput = {
+  name: string;
+  email: string;
+  membershipType: MembershipType;
+  skillRating: number;
+  duesStatus: DuesStatus;
+};
+
 type StoreValue = {
-  currentMemberId: string;
+  loading: boolean;
+  error: string | null;
+  club: Club | null;
+  members: Member[];
+  events: EventTemplate[];
+  instances: EventInstance[];
   bookings: Booking[];
+  currentMemberId: string | null;
+  isAdmin: boolean;
   statusFor: (instanceId: string) => InstanceStatus;
-  book: (instanceId: string) => void;
-  cancel: (instanceId: string) => void;
+  book: (instanceId: string) => Promise<void>;
+  cancel: (instanceId: string) => Promise<void>;
+  // Admin-only writes. Resolve to an error message string, or null on success.
+  createEvent: (input: EventInput) => Promise<string | null>;
+  updateEvent: (id: string, input: EventInput) => Promise<string | null>;
+  deleteEvent: (id: string) => Promise<string | null>;
+  createInstance: (input: InstanceInput) => Promise<string | null>;
+  deleteInstance: (id: string) => Promise<string | null>;
+  createMember: (input: MemberInput) => Promise<string | null>;
+  updateMember: (id: string, input: MemberInput) => Promise<string | null>;
+  deleteMember: (id: string) => Promise<string | null>;
+  refresh: () => Promise<void>;
 };
 
 const StoreContext = createContext<StoreValue | null>(null);
 
-export function StoreProvider({ children }: { children: ReactNode }) {
-  const [bookings, setBookings] = useState<Booking[]>(SEED_BOOKINGS);
-  const currentMemberId = CURRENT_MEMBER_ID;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  const capacityOf = useCallback((instanceId: string) => {
-    return EVENT_INSTANCES.find((i) => i.id === instanceId)?.capacity ?? 0;
-  }, []);
+// Right after sign-in, a just-minted token can look "issued in the future" to the
+// database replica for a moment (sub-second auth/replica clock skew). These calls
+// succeed on a quick retry, so we treat them as transient rather than real errors.
+function isTransientAuthError(message?: string | null): boolean {
+  if (!message) return false;
+  return /issued at future|not yet valid|before the .* claim|\biat\b|\bnbf\b/i.test(message);
+}
+
+// Runs a Supabase call, retrying a few times (with backoff) only on the transient
+// clock-skew error above. Returns the final result either way.
+async function withAuthRetry<T extends { error: any }>(run: () => Promise<T>): Promise<T> {
+  const maxAttempts = 4;
+  let result = await run();
+  for (let attempt = 1; attempt < maxAttempts && isTransientAuthError(result.error?.message); attempt++) {
+    await sleep(attempt * 700);
+    result = await run();
+  }
+  return result;
+}
+
+// ---- DB row -> app type mappers ----
+function toMember(r: any): Member {
+  return {
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    membershipType: r.membership_type,
+    skillRating: Number(r.skill_rating),
+    duesStatus: r.dues_status,
+    joinedAt: r.joined_at,
+  };
+}
+function toEvent(r: any): EventTemplate {
+  return {
+    id: r.id,
+    title: r.title,
+    durationMin: r.duration_min,
+    skillLevel: r.skill_level as SkillLevel,
+    instructor: r.instructor ?? null,
+  };
+}
+function toInstance(r: any): EventInstance {
+  return { id: r.id, eventId: r.event_id, startsAt: r.starts_at, capacity: r.capacity };
+}
+function toBooking(r: any): Booking {
+  return {
+    id: r.id,
+    instanceId: r.instance_id,
+    memberId: r.member_id,
+    status: r.status,
+    createdAt: r.created_at,
+  };
+}
+
+export function StoreProvider({ children }: { children: ReactNode }) {
+  const { userId, configured } = useAuth();
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [club, setClub] = useState<Club | null>(null);
+  const [members, setMembers] = useState<Member[]>([]);
+  const [events, setEvents] = useState<EventTemplate[]>([]);
+  const [instances, setInstances] = useState<EventInstance[]>([]);
+  const [bookings, setBookings] = useState<Booking[]>([]);
+  const [currentMemberId, setCurrentMemberId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!configured || !userId) return;
+    setError(null);
+    try {
+      const { data: results, error: batchError } = await withAuthRetry(async () => {
+        const [clubsRes, membersRes, eventsRes, instancesRes, bookingsRes] = await Promise.all([
+          supabase.from('clubs').select('*').limit(1).maybeSingle(),
+          supabase.from('members').select('*'),
+          supabase.from('events').select('*'),
+          supabase.from('event_instances').select('*'),
+          supabase.from('bookings').select('*'),
+        ]);
+        const error =
+          clubsRes.error || membersRes.error || eventsRes.error || instancesRes.error || bookingsRes.error;
+        return { data: { clubsRes, membersRes, eventsRes, instancesRes, bookingsRes }, error };
+      });
+      if (batchError) throw batchError;
+      const { clubsRes, membersRes, eventsRes, instancesRes, bookingsRes } = results;
+
+      const memberRows = membersRes.data ?? [];
+      // The current user's own member row is the one linked to their auth id.
+      const mine = memberRows.find((m: any) => m.user_id === userId);
+      setCurrentMemberId(mine ? mine.id : null);
+
+      setClub(clubsRes.data ? { id: clubsRes.data.id, name: clubsRes.data.name } : null);
+      setMembers(memberRows.map(toMember));
+      setEvents((eventsRes.data ?? []).map(toEvent));
+      setInstances((instancesRes.data ?? []).map(toInstance));
+      setBookings((bookingsRes.data ?? []).map(toBooking));
+    } catch (e: any) {
+      setError(e?.message ?? 'Failed to load club data');
+    }
+  }, [configured, userId]);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    load().finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [load]);
 
   const statusFor = useCallback(
     (instanceId: string): InstanceStatus => {
       const forInstance = bookings.filter((b) => b.instanceId === instanceId);
       const confirmed = forInstance.filter((b) => b.status === 'confirmed');
       const waitlisted = forInstance.filter((b) => b.status === 'waitlisted');
-      const capacity = capacityOf(instanceId);
+      const capacity = instances.find((i) => i.id === instanceId)?.capacity ?? 0;
       const openSlots = Math.max(0, capacity - confirmed.length);
-      const myBooking = forInstance.find((b) => b.memberId === currentMemberId) ?? null;
+      const myBooking =
+        (currentMemberId && forInstance.find((b) => b.memberId === currentMemberId)) || null;
       return {
         confirmedCount: confirmed.length,
         waitlistCount: waitlisted.length,
@@ -53,65 +209,211 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         myBooking,
       };
     },
-    [bookings, capacityOf, currentMemberId],
+    [bookings, instances, currentMemberId],
   );
 
   const book = useCallback(
-    (instanceId: string) => {
-      setBookings((prev) => {
-        // Ignore if already booked/waitlisted.
-        if (prev.some((b) => b.instanceId === instanceId && b.memberId === currentMemberId)) {
-          return prev;
-        }
-        const confirmedCount = prev.filter(
-          (b) => b.instanceId === instanceId && b.status === 'confirmed',
-        ).length;
-        const capacity = capacityOf(instanceId);
-        const status = confirmedCount < capacity ? 'confirmed' : 'waitlisted';
-        const newBooking: Booking = {
-          id: nextId(),
-          instanceId,
-          memberId: currentMemberId,
-          status,
-          createdAt: new Date().toISOString(),
-        };
-        return [...prev, newBooking];
-      });
+    async (instanceId: string) => {
+      const { error } = await withAuthRetry(async () =>
+        supabase.rpc('book_slot', { p_instance_id: instanceId }),
+      );
+      if (error) setError(error.message);
+      await load();
     },
-    [capacityOf, currentMemberId],
+    [load],
   );
 
   const cancel = useCallback(
-    (instanceId: string) => {
-      setBookings((prev) => {
-        const mine = prev.find(
-          (b) => b.instanceId === instanceId && b.memberId === currentMemberId,
-        );
-        if (!mine) return prev;
-
-        let next = prev.filter((b) => b.id !== mine.id);
-
-        // Auto-promote: if a confirmed seat was freed, promote the earliest waitlisted member.
-        if (mine.status === 'confirmed') {
-          const waitlist = next
-            .filter((b) => b.instanceId === instanceId && b.status === 'waitlisted')
-            .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-          const promote = waitlist[0];
-          if (promote) {
-            next = next.map((b) =>
-              b.id === promote.id ? { ...b, status: 'confirmed' } : b,
-            );
-          }
-        }
-        return next;
-      });
+    async (instanceId: string) => {
+      const { error } = await withAuthRetry(async () =>
+        supabase.rpc('cancel_booking', { p_instance_id: instanceId }),
+      );
+      if (error) setError(error.message);
+      await load();
     },
-    [currentMemberId],
+    [load],
+  );
+
+  const isAdmin = useMemo(
+    () => members.some((m) => m.id === currentMemberId && m.membershipType === 'admin'),
+    [members, currentMemberId],
+  );
+
+  const createEvent = useCallback(
+    async (input: EventInput): Promise<string | null> => {
+      if (!club) return 'No club loaded yet.';
+      const { error } = await withAuthRetry(async () =>
+        supabase.from('events').insert({
+          club_id: club.id,
+          title: input.title,
+          duration_min: input.durationMin,
+          skill_level: input.skillLevel,
+          instructor: input.instructor,
+        }),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [club, load],
+  );
+
+  const updateEvent = useCallback(
+    async (id: string, input: EventInput): Promise<string | null> => {
+      const { error } = await withAuthRetry(async () =>
+        supabase
+          .from('events')
+          .update({
+            title: input.title,
+            duration_min: input.durationMin,
+            skill_level: input.skillLevel,
+            instructor: input.instructor,
+          })
+          .eq('id', id),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load],
+  );
+
+  const deleteEvent = useCallback(
+    async (id: string): Promise<string | null> => {
+      const { error } = await withAuthRetry(async () => supabase.from('events').delete().eq('id', id));
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load],
+  );
+
+  const createInstance = useCallback(
+    async (input: InstanceInput): Promise<string | null> => {
+      const { error } = await withAuthRetry(async () =>
+        supabase.from('event_instances').insert({
+          event_id: input.eventId,
+          starts_at: input.startsAt,
+          capacity: input.capacity,
+        }),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load],
+  );
+
+  const deleteInstance = useCallback(
+    async (id: string): Promise<string | null> => {
+      const { error } = await withAuthRetry(async () =>
+        supabase.from('event_instances').delete().eq('id', id),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load],
+  );
+
+  const createMember = useCallback(
+    async (input: MemberInput): Promise<string | null> => {
+      if (!club) return 'No club loaded yet.';
+      const { error } = await withAuthRetry(async () =>
+        supabase.from('members').insert({
+          club_id: club.id,
+          name: input.name,
+          email: input.email,
+          membership_type: input.membershipType,
+          skill_rating: input.skillRating,
+          dues_status: input.duesStatus,
+        }),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [club, load],
+  );
+
+  const updateMember = useCallback(
+    async (id: string, input: MemberInput): Promise<string | null> => {
+      const { error } = await withAuthRetry(async () =>
+        supabase
+          .from('members')
+          .update({
+            name: input.name,
+            email: input.email,
+            membership_type: input.membershipType,
+            skill_rating: input.skillRating,
+            dues_status: input.duesStatus,
+          })
+          .eq('id', id),
+      );
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load],
+  );
+
+  const deleteMember = useCallback(
+    async (id: string): Promise<string | null> => {
+      const { error } = await withAuthRetry(async () => supabase.from('members').delete().eq('id', id));
+      if (error) return error.message;
+      await load();
+      return null;
+    },
+    [load],
   );
 
   const value = useMemo<StoreValue>(
-    () => ({ currentMemberId, bookings, statusFor, book, cancel }),
-    [currentMemberId, bookings, statusFor, book, cancel],
+    () => ({
+      loading,
+      error,
+      club,
+      members,
+      events,
+      instances,
+      bookings,
+      currentMemberId,
+      isAdmin,
+      statusFor,
+      book,
+      cancel,
+      createEvent,
+      updateEvent,
+      deleteEvent,
+      createInstance,
+      deleteInstance,
+      createMember,
+      updateMember,
+      deleteMember,
+      refresh: load,
+    }),
+    [
+      loading,
+      error,
+      club,
+      members,
+      events,
+      instances,
+      bookings,
+      currentMemberId,
+      isAdmin,
+      statusFor,
+      book,
+      cancel,
+      createEvent,
+      updateEvent,
+      deleteEvent,
+      createInstance,
+      deleteInstance,
+      createMember,
+      updateMember,
+      deleteMember,
+      load,
+    ],
   );
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
@@ -121,8 +423,4 @@ export function useStore() {
   const ctx = useContext(StoreContext);
   if (!ctx) throw new Error('useStore must be used within a StoreProvider');
   return ctx;
-}
-
-export function memberName(memberId: string): string {
-  return MEMBERS.find((m) => m.id === memberId)?.name ?? 'Unknown';
 }
